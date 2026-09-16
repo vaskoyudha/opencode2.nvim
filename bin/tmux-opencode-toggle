@@ -1,0 +1,112 @@
+#!/usr/bin/env bash
+# tmux-opencode-toggle: Universal Project-Aware Toggle for OpenCode 2
+# Works from anywhere: inside Neovim, inside OpenCode itself, or in any shell pane.
+# Project-aware: remembers which project each OpenCode session belongs to.
+# - Same project: toggles Hide / Show without killing or restarting.
+# - Switched project: stashes the previous project session and restores/spawns the matching one.
+# Stash is isolated in a background session (_opencode_stash) so NO extra windows appear in the active session.
+set -euo pipefail
+
+STASH_SESSION="_opencode_stash"
+
+ensure_stash_session() {
+  if ! tmux has-session -t "$STASH_SESSION" 2>/dev/null; then
+    tmux new-session -d -s "$STASH_SESSION" -n "[stash-holder]" "tail -f /dev/null"
+  fi
+}
+
+canonical_root() {
+  local p="${1:-}"
+  if [ -z "$p" ]; then
+    echo "$HOME"
+    return
+  fi
+  local r
+  r="$(realpath -q "$p" 2>/dev/null || echo "$p")"
+  local git_r
+  git_r="$(git -C "$r" rev-parse --show-toplevel 2>/dev/null || true)"
+  echo "${git_r:-$r}"
+}
+
+pane_id="${1:-$(tmux display-message -p '#{pane_id}')}"
+session="${2:-$(tmux display-message -p -t "$pane_id" '#{session_name}')}"
+current_win="$(tmux display-message -p -t "$pane_id" '#{window_id}')"
+
+# Case 1: Triggered from INSIDE an OpenCode pane -> Hide (stash) it immediately
+is_curr_opencode="$(tmux show-options -pqv -t "$pane_id" @opencode 2>/dev/null || true)"
+if [ "$is_curr_opencode" = "1" ]; then
+  ensure_stash_session
+  other_pane="$(tmux list-panes -t "$current_win" -F '#{pane_id} #{@opencode}' | awk '$2 != "1" {print $1}' | head -n 1)"
+  tmux break-pane -d -s "$pane_id" -t "${STASH_SESSION}:" -n "oc-${pane_id#%}"
+  if [ -n "$other_pane" ]; then
+    tmux select-pane -t "$other_pane"
+  fi
+  exit 0
+fi
+
+# Case 2: An OpenCode pane is ALREADY VISIBLE in this window -> Toggle OFF (stash it)
+visible_opencode="$(tmux list-panes -t "$current_win" -F '#{pane_id} #{@opencode}' | awk '$2 == "1" {print $1; exit}')"
+if [ -n "$visible_opencode" ]; then
+  ensure_stash_session
+  tmux break-pane -d -s "$visible_opencode" -t "${STASH_SESSION}:" -n "oc-${visible_opencode#%}"
+  tmux select-pane -t "$pane_id"
+  exit 0
+fi
+
+# Case 3: OpenCode is NOT visible -> Resolve target project and restore or spawn
+raw_dir="${3:-}"
+if [ -z "$raw_dir" ]; then
+  pane_pid="$(tmux display-message -p -t "$pane_id" '#{pane_pid}' 2>/dev/null || true)"
+  if [ -n "$pane_pid" ]; then
+    # Look for nvim running under this pane
+    nvim_pid="$(pgrep -P "$pane_pid" nvim 2>/dev/null | head -n 1 || true)"
+    if [ -n "$nvim_pid" ] && [ -d "/proc/$nvim_pid/cwd" ]; then
+      raw_dir="$(readlink -f "/proc/$nvim_pid/cwd" 2>/dev/null || true)"
+    fi
+  fi
+fi
+
+if [ -z "$raw_dir" ]; then
+  raw_dir="$(tmux display-message -p -t "$pane_id" '#{pane_current_path}' 2>/dev/null || echo "$HOME")"
+fi
+
+target_root="$(canonical_root "$raw_dir")"
+
+# Look for an existing OpenCode pane matching THIS exact project root
+# Search in STASH_SESSION first, then in all panes
+matched_pane=""
+if tmux has-session -t "$STASH_SESSION" 2>/dev/null; then
+  for p in $(tmux list-panes -s -t "$STASH_SESSION" -F '#{pane_id} #{@opencode}' 2>/dev/null | awk '$2 == "1" {print $1}'); do
+    p_dir="$(tmux show-options -pqv -t "$p" @opencode_dir 2>/dev/null || true)"
+    if [ "$(canonical_root "$p_dir")" = "$target_root" ]; then
+      matched_pane="$p"
+      break
+    fi
+  done
+fi
+
+if [ -z "$matched_pane" ]; then
+  for p in $(tmux list-panes -a -F '#{pane_id} #{@opencode}' 2>/dev/null | awk '$2 == "1" {print $1}'); do
+    p_dir="$(tmux show-options -pqv -t "$p" @opencode_dir 2>/dev/null || true)"
+    if [ -n "$p_dir" ] && [ "$(canonical_root "$p_dir")" = "$target_root" ]; then
+      matched_pane="$p"
+      break
+    fi
+  done
+fi
+
+width="$(tmux display-message -p -t "$pane_id" '#{pane_width}')"
+size=$((width * 28 / 100))
+[ "$size" -lt 45 ] && size=45
+
+if [ -n "$matched_pane" ]; then
+  tmux join-pane -h -l "$size" -s "$matched_pane" -t "$pane_id"
+  tmux select-pane -t "$matched_pane"
+  exit 0
+fi
+
+# Not found for this project -> Spawn fresh opencode2 session at project root
+new_pane="$(tmux split-window -h -l "$size" -t "$pane_id" -c "$target_root" -P -F '#{pane_id}' "opencode2 '$target_root'")"
+tmux set-option -p -t "$new_pane" @opencode 1
+tmux set-option -p -t "$new_pane" @opencode_dir "$target_root"
+tmux select-pane -t "$new_pane"
